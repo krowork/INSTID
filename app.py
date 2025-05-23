@@ -6,11 +6,13 @@ import torch
 import random
 import numpy as np
 import argparse
+import logging
+from pathlib import Path
 
 import PIL
 from PIL import Image
 
-import diffusers
+from diffusers import StableDiffusionXLControlNetPipeline
 from diffusers.utils import load_image
 from diffusers.models import ControlNetModel
 
@@ -22,41 +24,130 @@ from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPip
 
 import gradio as gr
 
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import LocalEntryNotFoundError, RepositoryNotFoundError
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # global variable
 MAX_SEED = np.iinfo(np.int32).max
 #device = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float16
-if torch.backends.mps.is_available():
-  device = "mps"
-  torch_dtype = torch.float32
-elif torch.cuda.is_available():
-  device = "cuda"
-else:
-  device = "cpu"
+
+# Device configuration with memory optimization settings
+def setup_device():
+    if torch.backends.mps.is_available():
+        return "mps", torch.float32
+    elif torch.cuda.is_available():
+        # Check available GPU memory
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # Convert to GB
+        logger.info(f"Available GPU memory: {gpu_memory:.2f} GB")
+        return "cuda", torch.float16
+    else:
+        return "cpu", torch.float32
+
+device, torch_dtype = setup_device()
 STYLE_NAMES = list(styles.keys())
 DEFAULT_STYLE_NAME = "Watercolor"
 
-# download checkpoints
-from huggingface_hub import hf_hub_download
-hf_hub_download(repo_id="InstantX/InstantID", filename="ControlNetModel/config.json", local_dir="./checkpoints")
-hf_hub_download(repo_id="InstantX/InstantID", filename="ControlNetModel/diffusion_pytorch_model.safetensors", local_dir="./checkpoints")
-hf_hub_download(repo_id="InstantX/InstantID", filename="ip-adapter.bin", local_dir="./checkpoints")
+# Create checkpoints directory if it doesn't exist
+CHECKPOINTS_DIR = Path("./checkpoints")
+CHECKPOINTS_DIR.mkdir(exist_ok=True)
 
-# Load face encoder
-app = FaceAnalysis(name='antelopev2', root='./', providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=0, det_size=(640, 640))
+def download_model_files():
+    """Download required model files with error handling and progress tracking."""
+    model_files = [
+        {"filename": "ControlNetModel/config.json", "desc": "ControlNet config"},
+        {"filename": "ControlNetModel/diffusion_pytorch_model.safetensors", "desc": "ControlNet model"},
+        {"filename": "ip-adapter.bin", "desc": "IP-Adapter weights"}
+    ]
+    
+    for file_info in model_files:
+        file_path = CHECKPOINTS_DIR / file_info["filename"]
+        if not file_path.parent.exists():
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+        try:
+            if not file_path.exists():
+                logger.info(f"Downloading {file_info['desc']}...")
+                hf_hub_download(
+                    repo_id="InstantX/InstantID",
+                    filename=file_info["filename"],
+                    local_dir="./checkpoints",
+                    resume_download=True
+                )
+                logger.info(f"Successfully downloaded {file_info['desc']}")
+            else:
+                logger.info(f"{file_info['desc']} already exists, skipping download")
+        except (LocalEntryNotFoundError, RepositoryNotFoundError) as e:
+            logger.error(f"Error downloading {file_info['desc']}: {str(e)}")
+            raise RuntimeError(f"Failed to download required model file: {file_info['filename']}")
+        except Exception as e:
+            logger.error(f"Unexpected error downloading {file_info['desc']}: {str(e)}")
+            raise
+
+# Download model files
+download_model_files()
+
+# Load face encoder with error handling
+def setup_face_analyzer():
+    try:
+        app = FaceAnalysis(name='antelopev2', root='./', providers=['CPUExecutionProvider'])
+        app.prepare(ctx_id=0, det_size=(640, 640))
+        return app
+    except Exception as e:
+        logger.error(f"Error initializing face analyzer: {str(e)}")
+        raise RuntimeError("Failed to initialize face analyzer")
+
+app = setup_face_analyzer()
 
 # Path to InstantID models
-face_adapter = f'./checkpoints/ip-adapter.bin'
-controlnet_path = f'./checkpoints/ControlNetModel'
+face_adapter = str(CHECKPOINTS_DIR / 'ip-adapter.bin')
+controlnet_path = str(CHECKPOINTS_DIR / 'ControlNetModel')
 
-# Load pipeline
-#controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch.float16)
-controlnet = ControlNetModel.from_pretrained(controlnet_path, torch_dtype=torch_dtype)
+# Load pipeline with error handling
+def load_controlnet():
+    try:
+        return ControlNetModel.from_pretrained(
+            controlnet_path,
+            torch_dtype=torch_dtype,
+            safety_checker=None,
+            use_safetensors=True
+        )
+    except Exception as e:
+        logger.error(f"Error loading ControlNet model: {str(e)}")
+        raise RuntimeError("Failed to load ControlNet model")
 
-#base_model_path = 'RunDiffusion/Juggernaut-XL-v8'
+controlnet = load_controlnet()
 
+# Memory optimization utilities
+def enable_model_cpu_offload(pipe):
+    """Enable CPU offloading for better memory management."""
+    if device == "cuda":
+        pipe.enable_model_cpu_offload()
+        pipe.enable_sequential_cpu_offload()
+    return pipe
 
+def enable_attention_slicing(pipe):
+    """Enable attention slicing for memory efficiency."""
+    if device in ["cuda", "mps"]:
+        pipe.enable_attention_slicing(slice_size="auto")
+    return pipe
+
+def enable_vae_tiling(pipe):
+    """Enable VAE tiling for processing large images."""
+    if device == "cuda":
+        pipe.enable_vae_tiling()
+    return pipe
+
+def optimize_pipeline(pipe):
+    """Apply all memory optimization techniques to the pipeline."""
+    pipe = enable_model_cpu_offload(pipe)
+    pipe = enable_attention_slicing(pipe)
+    pipe = enable_vae_tiling(pipe)
+    return pipe
 
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
     if randomize_seed:
@@ -144,28 +235,28 @@ def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,2
     out_img_pil = Image.fromarray(out_img.astype(np.uint8))
     return out_img_pil
 
-#def resize_img(input_image, max_side=820, min_side=678, size=None, 
-#              pad_to_max_side=False, mode=PIL.Image.BILINEAR, base_pixel_number=64):
-#
-#        w, h = input_image.size
-#        if size is not None:
-#            w_resize_new, h_resize_new = size
-#        else:
-#            ratio = min_side / min(h, w)
-#            w, h = round(ratio*w), round(ratio*h)
-#            ratio = max_side / max(h, w)
-#            input_image = input_image.resize([round(ratio*w), round(ratio*h)], mode)
-#            w_resize_new = (round(ratio * w) // base_pixel_number) * base_pixel_number
-#            h_resize_new = (round(ratio * h) // base_pixel_number) * base_pixel_number
-#        input_image = input_image.resize([w_resize_new, h_resize_new], mode)
-#
-#        if pad_to_max_side:
-#            res = np.ones([max_side, max_side, 3], dtype=np.uint8) * 255
-#            offset_x = (max_side - w_resize_new) // 2
-#            offset_y = (max_side - h_resize_new) // 2
-#            res[offset_y:offset_y+h_resize_new, offset_x:offset_x+w_resize_new] = np.array(input_image)
-#            input_image = Image.fromarray(res)
-#        return input_image
+def resize_img(input_image, max_side=820, min_side=678, size=None, 
+              pad_to_max_side=False, mode=PIL.Image.BILINEAR, base_pixel_number=64):
+    
+    w, h = input_image.size
+    if size is not None:
+        w_resize_new, h_resize_new = size
+    else:
+        ratio = min_side / min(h, w)
+        w, h = round(ratio*w), round(ratio*h)
+        ratio = max_side / max(h, w)
+        input_image = input_image.resize([round(ratio*w), round(ratio*h)], mode)
+        w_resize_new = (round(ratio * w) // base_pixel_number) * base_pixel_number
+        h_resize_new = (round(ratio * h) // base_pixel_number) * base_pixel_number
+    input_image = input_image.resize([w_resize_new, h_resize_new], mode)
+
+    if pad_to_max_side:
+        res = np.ones([max_side, max_side, 3], dtype=np.uint8) * 255
+        offset_x = (max_side - w_resize_new) // 2
+        offset_y = (max_side - h_resize_new) // 2
+        res[offset_y:offset_y+h_resize_new, offset_x:offset_x+w_resize_new] = np.array(input_image)
+        input_image = Image.fromarray(res)
+    return input_image
 
 def apply_style(style_name: str, positive: str, negative: str = "") -> tuple[str, str]:
     p, n = styles.get(style_name, styles[DEFAULT_STYLE_NAME])
@@ -173,80 +264,98 @@ def apply_style(style_name: str, positive: str, negative: str = "") -> tuple[str
 
 #@spaces.GPU
 def generate_image(face_image, pose_image, prompt, negative_prompt, style_name, enhance_face_region, num_steps, identitynet_strength_ratio, adapter_strength_ratio, guidance_scale, seed, progress=gr.Progress(track_tqdm=True)):
-
-    if face_image is None:
-        raise gr.Error(f"Cannot find any input face image! Please upload the face image")
-    
-    if prompt is None:
-        prompt = "a person"
-    
-    # apply the style template
-    prompt, negative_prompt = apply_style(style_name, prompt, negative_prompt)
-    
-    face_image = load_image(face_image[0])
-    face_image = resize_img(face_image)
-    face_image_cv2 = convert_from_image_to_cv2(face_image)
-    height, width, _ = face_image_cv2.shape
-    
-    # Extract face features
-    face_info = app.get(face_image_cv2)
-    
-    if len(face_info) == 0:
-        raise gr.Error(f"Cannot find any face in the image! Please upload another person image")
-    
-    face_info = face_info[-1]
-    face_emb = face_info['embedding']
-    face_kps = draw_kps(convert_from_cv2_to_image(face_image_cv2), face_info['kps'])
-    
-    if pose_image is not None:
-        pose_image = load_image(pose_image[0])
-        pose_image = resize_img(pose_image)
-        pose_image_cv2 = convert_from_image_to_cv2(pose_image)
+    try:
+        if face_image is None:
+            raise gr.Error("Cannot find any input face image! Please upload the face image")
         
-        face_info = app.get(pose_image_cv2)
+        if prompt is None:
+            prompt = "a person"
+        
+        # apply the style template
+        prompt, negative_prompt = apply_style(style_name, prompt, negative_prompt)
+        
+        face_image = load_image(face_image[0])
+        face_image = resize_img(face_image)
+        face_image_cv2 = convert_from_image_to_cv2(face_image)
+        height, width, _ = face_image_cv2.shape
+        
+        # Extract face features with error handling
+        face_info = app.get(face_image_cv2)
         
         if len(face_info) == 0:
-            raise gr.Error(f"Cannot find any face in the reference image! Please upload another person image")
+            raise gr.Error("Cannot find any face in the image! Please upload another person image")
         
         face_info = face_info[-1]
-        face_kps = draw_kps(pose_image, face_info['kps'])
+        face_emb = face_info['embedding']
+        face_kps = draw_kps(convert_from_cv2_to_image(face_image_cv2), face_info['kps'])
         
-        width, height = face_kps.size
-    
-    if enhance_face_region:
-        control_mask = np.zeros([height, width, 3])
-        x1, y1, x2, y2 = face_info['bbox']
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        control_mask[y1:y2, x1:x2] = 255
-        control_mask = Image.fromarray(control_mask.astype(np.uint8))
-    else:
-        control_mask = None
-    
-    generator = torch.Generator(device=device).manual_seed(seed)
-    
-    print("Start inference...")
-    print(f"[Debug] Prompt: {prompt}, \n[Debug] Neg Prompt: {negative_prompt}")
-    
-    pipe.set_ip_adapter_scale(adapter_strength_ratio)
-    images = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        image_embeds=face_emb,
-        image=face_kps,
-        control_mask=control_mask,
-        controlnet_conditioning_scale=float(identitynet_strength_ratio),
-        num_inference_steps=num_steps,
-        guidance_scale=guidance_scale,
-        height=height,
-        width=width,
-        generator=generator
-    ).images
+        if pose_image is not None:
+            pose_image = load_image(pose_image[0])
+            pose_image = resize_img(pose_image)
+            pose_image_cv2 = convert_from_image_to_cv2(pose_image)
+            
+            face_info = app.get(pose_image_cv2)
+            
+            if len(face_info) == 0:
+                raise gr.Error("Cannot find any face in the reference image! Please upload another person image")
+            
+            face_info = face_info[-1]
+            face_kps = draw_kps(pose_image, face_info['kps'])
+            
+            width, height = face_kps.size
+        
+        if enhance_face_region:
+            control_mask = np.zeros([height, width, 3])
+            x1, y1, x2, y2 = face_info['bbox']
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            control_mask[y1:y2, x1:x2] = 255
+            control_mask = Image.fromarray(control_mask.astype(np.uint8))
+        else:
+            control_mask = None
+        
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        logger.info("Starting inference...")
+        logger.info(f"Prompt: {prompt}")
+        logger.info(f"Negative Prompt: {negative_prompt}")
+        
+        # Memory optimization before generation
+        torch.cuda.empty_cache()
+        
+        pipe.set_ip_adapter_scale(adapter_strength_ratio)
+        with torch.inference_mode():
+            images = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image_embeds=face_emb,
+                image=face_kps,
+                control_mask=control_mask,
+                controlnet_conditioning_scale=float(identitynet_strength_ratio),
+                num_inference_steps=num_steps,
+                guidance_scale=guidance_scale,
+                height=height,
+                width=width,
+                generator=generator,
+                cross_attention_kwargs={"scale": 1.0}
+            ).images
 
-    return images, gr.update(visible=True)
+        # Clean up memory after generation
+        torch.cuda.empty_cache()
+        
+        return images, gr.update(visible=True)
+    
+    except Exception as e:
+        logger.error(f"Error during image generation: {str(e)}")
+        raise gr.Error(str(e))
 
 def clear_cuda_cache():
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    """Enhanced memory cleanup function."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception as e:
+        logger.error(f"Error clearing CUDA cache: {str(e)}")
 
 ### Description
 title = r"""
@@ -425,72 +534,47 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     
-    # Default values for max_side and min_side
-    max_side = 1280
-    min_side = 1024
-
-    # Adjust max_side and min_side based on the arguments
-    if args.medvram:
-        max_side, min_side = 1024, 832
-    elif args.lowvram:
+    # Adjust settings based on VRAM availability
+    if args.lowvram:
         max_side, min_side = 832, 640
+        logger.info("Using low VRAM settings")
+    elif args.medvram:
+        max_side, min_side = 1024, 832
+        logger.info("Using medium VRAM settings")
+    else:
+        max_side, min_side = 1280, 1024
+        logger.info("Using standard VRAM settings")
 
-    # Display the current resolution settings
-    print(f"Current resolution settings: max_side = {max_side}, min_side = {min_side}")
+    logger.info(f"Current resolution settings: max_side = {max_side}, min_side = {min_side}")
 
-    # Modify the resize_img function call to pass max_side and min_side
-    def resize_img(input_image, size=None, pad_to_max_side=False, mode=PIL.Image.BILINEAR, base_pixel_number=64):
-        w, h = input_image.size
-        if size is not None:
-            w_resize_new, h_resize_new = size
-        else:
-            ratio = min_side / min(h, w)
-            w, h = round(ratio * w), round(ratio * h)
-            ratio = max_side / max(h, w)
-            input_image = input_image.resize([round(ratio * w), round(ratio * h)], mode)
-            w_resize_new = (round(ratio * w) // base_pixel_number) * base_pixel_number
-            h_resize_new = (round(ratio * h) // base_pixel_number) * base_pixel_number
-        input_image = input_image.resize([w_resize_new, h_resize_new], mode)
-
-        if pad_to_max_side:
-            res = np.ones([max_side, max_side, 3], dtype=np.uint8) * 255
-            offset_x = (max_side - w_resize_new) // 2
-            offset_y = (max_side - h_resize_new) // 2
-            res[offset_y:offset_y + h_resize_new, offset_x:offset_x + w_resize_new] = np.array(input_image)
-            input_image = Image.fromarray(res)
-        return input_image
+    # Initialize the pipeline with optimizations
+    try:
+        pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
+            args.model_path,
+            controlnet=controlnet,
+            torch_dtype=torch_dtype,
+            safety_checker=None,
+            feature_extractor=None,
+        )
         
-
-    # Set the base_model_path based on the argument
-    base_model_path = args.model_path
-
-    # If no argument is provided, it defaults to 'stablediffusionapi/juggernaut-xl-v8'
-    
-    # Display only the arguments currently in use
-    print("Arguments currently in use:")
-    default_values = parser.parse_args([])
-    for arg, value in vars(args).items():
-        if value != getattr(default_values, arg):
-            print(f"  {arg}: {value}")
-            
-    pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
-    base_model_path,
-    controlnet=controlnet,
-    #torch_dtype=torch.float16,
-    torch_dtype=torch_dtype,
-    safety_checker=None,
-    feature_extractor=None,
-)
-if device == 'mps':
-    pipe.to("mps", torch_dtype)
-    pipe.enable_attention_slicing()
-elif device == 'cuda':
-    pipe.cuda()
-pipe.load_ip_adapter_instantid(face_adapter)
-#pipe.image_proj_model.to('cuda')
-#pipe.unet.to('cuda')
-if device == 'mps' or device == 'cuda':
-    pipe.image_proj_model.to(device)
-    pipe.unet.to(device)
-
-    demo.launch(inbrowser=args.inbrowser, server_port=args.server_port, share=args.share)
+        # Apply memory optimizations
+        pipe = optimize_pipeline(pipe)
+        
+        if device == 'mps':
+            pipe.to("mps", torch_dtype)
+        elif device == 'cuda':
+            pipe.cuda()
+        
+        pipe.load_ip_adapter_instantid(face_adapter)
+        
+        if device in ['mps', 'cuda']:
+            pipe.image_proj_model.to(device)
+            pipe.unet.to(device)
+        
+        logger.info("Pipeline initialized successfully")
+        
+        demo.launch(inbrowser=args.inbrowser, server_port=args.server_port, share=args.share)
+        
+    except Exception as e:
+        logger.error(f"Error initializing pipeline: {str(e)}")
+        raise

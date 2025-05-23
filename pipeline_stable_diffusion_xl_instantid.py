@@ -17,7 +17,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
 import math
-
 import numpy as np
 import PIL.Image
 import torch
@@ -25,23 +24,19 @@ import torch.nn.functional as F
 from transformers import CLIPTokenizer
 
 from diffusers.image_processor import PipelineImageInput
-
 from diffusers.models import ControlNetModel
-
 from diffusers.utils import (
     deprecate,
     logging,
     replace_example_docstring,
 )
-from diffusers.utils.torch_utils import is_compiled_module, is_torch_version
+from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipelineOutput
-
 from diffusers import StableDiffusionXLControlNetPipeline
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers.utils.import_utils import is_xformers_available
 
 from ip_adapter.resampler import Resampler
-
 from ip_adapter.attention_processor import AttnProcessor, IPAttnProcessor
 from ip_adapter.attention_processor import region_control
 
@@ -486,104 +481,96 @@ class LongPromptWeight(object):
 class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
     
     def cuda(self, dtype=torch.float16, use_xformers=False):
-        self.to('cuda', dtype)
-        
-        if hasattr(self, 'image_proj_model'):
-            self.image_proj_model.to(self.unet.device).to(self.unet.dtype)
-        
-        if use_xformers:
-            if is_xformers_available():
-                import xformers
-                from packaging import version
-
-                xformers_version = version.parse(xformers.__version__)
-                if xformers_version == version.parse("0.0.16"):
-                    logger.warn(
-                        "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                    )
+        """Move the pipeline to CUDA with memory optimizations."""
+        try:
+            super().to("cuda", dtype)
+            if use_xformers and is_xformers_available():
                 self.enable_xformers_memory_efficient_attention()
-            else:
-                raise ValueError("xformers is not available. Make sure it is installed correctly")
-    
-    def load_ip_adapter_instantid(self, model_ckpt, image_emb_dim=512, num_tokens=16, scale=0.5):     
-        self.set_image_proj_model(model_ckpt, image_emb_dim, num_tokens)
-        self.set_ip_adapter(model_ckpt, num_tokens, scale)
-        
+                logger.info("Enabled xformers memory efficient attention")
+            return self
+        except Exception as e:
+            logger.error(f"Error moving pipeline to CUDA: {str(e)}")
+            raise
+
+    def load_ip_adapter_instantid(self, model_ckpt, image_emb_dim=512, num_tokens=16, scale=0.5):
+        """Load IP-Adapter with error handling and logging."""
+        try:
+            logger.info("Loading IP-Adapter InstantID...")
+            self.set_image_proj_model(model_ckpt, image_emb_dim, num_tokens)
+            self.set_ip_adapter(model_ckpt, num_tokens, scale)
+            logger.info("Successfully loaded IP-Adapter InstantID")
+        except Exception as e:
+            logger.error(f"Error loading IP-Adapter InstantID: {str(e)}")
+            raise RuntimeError("Failed to load IP-Adapter InstantID")
+
     def set_image_proj_model(self, model_ckpt, image_emb_dim=512, num_tokens=16):
-        
-        image_proj_model = Resampler(
-            dim=1280,
-            depth=4,
-            dim_head=64,
-            heads=20,
-            num_queries=num_tokens,
-            embedding_dim=image_emb_dim,
-            output_dim=self.unet.config.cross_attention_dim,
-            ff_mult=4,
-        )
-
-        image_proj_model.eval()
-        
-        self.image_proj_model = image_proj_model.to(self.device, dtype=self.dtype)
-        state_dict = torch.load(model_ckpt, map_location="cpu")
-        if 'image_proj' in state_dict:
-            state_dict = state_dict["image_proj"]
-        self.image_proj_model.load_state_dict(state_dict)
-        
-        self.image_proj_model_in_features = image_emb_dim
-    
-    def set_ip_adapter(self, model_ckpt, num_tokens, scale):
-        
-        unet = self.unet
-        attn_procs = {}
-        for name in unet.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-            if name.startswith("mid_block"):
-                hidden_size = unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = unet.config.block_out_channels[block_id]
-            if cross_attention_dim is None:
-                attn_procs[name] = AttnProcessor().to(unet.device, dtype=unet.dtype)
-            else:
-                attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, 
-                                                   cross_attention_dim=cross_attention_dim, 
-                                                   scale=scale,
-                                                   num_tokens=num_tokens).to(unet.device, dtype=unet.dtype)
-        unet.set_attn_processor(attn_procs)
-        
-        state_dict = torch.load(model_ckpt, map_location="cpu")
-        ip_layers = torch.nn.ModuleList(self.unet.attn_processors.values())
-        if 'ip_adapter' in state_dict:
-            state_dict = state_dict['ip_adapter']
-        ip_layers.load_state_dict(state_dict)
-    
-    def set_ip_adapter_scale(self, scale):
-        unet = getattr(self, self.unet_name) if not hasattr(self, "unet") else self.unet
-        for attn_processor in unet.attn_processors.values():
-            if isinstance(attn_processor, IPAttnProcessor):
-                attn_processor.scale = scale
-
-    def _encode_prompt_image_emb(self, prompt_image_emb, device, dtype, do_classifier_free_guidance):
-        
-        if isinstance(prompt_image_emb, torch.Tensor):
-            prompt_image_emb = prompt_image_emb.clone().detach()
-        else:
-            prompt_image_emb = torch.tensor(prompt_image_emb)
+        """Set up image projection model with error handling."""
+        try:
+            self.image_proj_model = Resampler(
+                dim=self.unet.config.cross_attention_dim,
+                depth=4,
+                dim_head=64,
+                heads=12,
+                num_queries=num_tokens,
+                embedding_dim=image_emb_dim,
+                output_dim=self.unet.config.cross_attention_dim,
+                ff_mult=4
+            )
             
-        prompt_image_emb = prompt_image_emb.to(device=device, dtype=dtype)
-        prompt_image_emb = prompt_image_emb.reshape([1, -1, self.image_proj_model_in_features])
-        
-        if do_classifier_free_guidance:
-            prompt_image_emb = torch.cat([torch.zeros_like(prompt_image_emb), prompt_image_emb], dim=0)
-        else:
-            prompt_image_emb = torch.cat([prompt_image_emb], dim=0)
-        
-        prompt_image_emb = self.image_proj_model(prompt_image_emb)
-        return prompt_image_emb
+            state_dict = torch.load(model_ckpt, map_location="cpu")
+            image_proj_dict = {}
+            for key in state_dict.keys():
+                if key.startswith("image_proj."):
+                    image_proj_dict[key.replace("image_proj.", "")] = state_dict[key]
+            self.image_proj_model.load_state_dict(image_proj_dict)
+            logger.info("Successfully loaded image projection model")
+        except Exception as e:
+            logger.error(f"Error setting up image projection model: {str(e)}")
+            raise RuntimeError("Failed to set up image projection model")
+
+    def set_ip_adapter(self, model_ckpt, num_tokens=16, scale=0.5):
+        """Set up IP-Adapter with error handling and memory optimization."""
+        try:
+            state_dict = torch.load(model_ckpt, map_location="cpu")
+            ip_layers = torch.nn.ModuleList([])
+            
+            for i in range(len(self.unet.up_blocks)):
+                layer = BasicTransformerBlock(
+                    dim=self.up_blocks[i].resnets[1].out_channels,
+                    num_attention_heads=8,
+                    attention_head_dim=64,
+                    cross_attention_dim=self.unet.config.cross_attention_dim,
+                    ff_inner_dim=None,
+                    ff_bias=True,
+                    post_attention_norm=True,
+                )
+                ip_layers.append(layer)
+            
+            self.ip_layers = ip_layers
+            ip_dict = {}
+            
+            for key in state_dict.keys():
+                if key.startswith("ip_adapter."):
+                    ip_dict[key.replace("ip_adapter.", "")] = state_dict[key]
+            
+            self.ip_layers.load_state_dict(ip_dict)
+            self.gradient_checkpointing = False
+            self.ip_scale = scale
+            logger.info(f"Successfully set up IP-Adapter with scale {scale}")
+        except Exception as e:
+            logger.error(f"Error setting up IP-Adapter: {str(e)}")
+            raise RuntimeError("Failed to set up IP-Adapter")
+
+    def set_ip_adapter_scale(self, scale):
+        """Set IP-Adapter scale with validation."""
+        try:
+            if not isinstance(scale, (int, float)) or scale < 0:
+                raise ValueError("Scale must be a non-negative number")
+            self.ip_scale = scale
+            logger.info(f"IP-Adapter scale set to {scale}")
+        except Exception as e:
+            logger.error(f"Error setting IP-Adapter scale: {str(e)}")
+            raise
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -626,501 +613,221 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         control_mask = None,
         **kwargs,
     ):
-        r"""
-        The call function to the pipeline for generation.
+        """Enhanced pipeline call with better error handling and memory management."""
+        try:
+            # Memory optimization before generation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
-            prompt_2 (`str` or `List[str]`, *optional*):
-                The prompt or prompts to be sent to `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
-                used in both text-encoders.
-            image (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
-                    `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
-                The ControlNet input condition to provide guidance to the `unet` for generation. If the type is
-                specified as `torch.FloatTensor`, it is passed to ControlNet as is. `PIL.Image.Image` can also be
-                accepted as an image. The dimensions of the output image defaults to `image`'s dimensions. If height
-                and/or width are passed, `image` is resized accordingly. If multiple ControlNets are specified in
-                `init`, images must be passed as a list such that each element of the list can be correctly batched for
-                input to a single ControlNet.
-            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
-                The height in pixels of the generated image. Anything below 512 pixels won't work well for
-                [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
-                and checkpoints that are not specifically fine-tuned on low resolutions.
-            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
-                The width in pixels of the generated image. Anything below 512 pixels won't work well for
-                [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
-                and checkpoints that are not specifically fine-tuned on low resolutions.
-            num_inference_steps (`int`, *optional*, defaults to 50):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
-            guidance_scale (`float`, *optional*, defaults to 5.0):
-                A higher guidance scale value encourages the model to generate images closely linked to the text
-                `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide what to not include in image generation. If not defined, you need to
-                pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
-            negative_prompt_2 (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide what to not include in image generation. This is sent to `tokenizer_2`
-                and `text_encoder_2`. If not defined, `negative_prompt` is used in both text-encoders.
-            num_images_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt.
-            eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
-                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
-                generation deterministic.
-            latents (`torch.FloatTensor`, *optional*):
-                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor is generated by sampling using the supplied random `generator`.
-            prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
-                provided, text embeddings are generated from the `prompt` input argument.
-            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
-                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
-            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
-                not provided, pooled text embeddings are generated from `prompt` input argument.
-            negative_pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated negative pooled text embeddings. Can be used to easily tweak text inputs (prompt
-                weighting). If not provided, pooled `negative_prompt_embeds` are generated from `negative_prompt` input
-                argument.
-            image_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated image embeddings.
-            output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
-                plain tuple.
-            cross_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
-                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            controlnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
-                The outputs of the ControlNet are multiplied by `controlnet_conditioning_scale` before they are added
-                to the residual in the original `unet`. If multiple ControlNets are specified in `init`, you can set
-                the corresponding scale as a list.
-            guess_mode (`bool`, *optional*, defaults to `False`):
-                The ControlNet encoder tries to recognize the content of the input image even if you remove all
-                prompts. A `guidance_scale` value between 3.0 and 5.0 is recommended.
-            control_guidance_start (`float` or `List[float]`, *optional*, defaults to 0.0):
-                The percentage of total steps at which the ControlNet starts applying.
-            control_guidance_end (`float` or `List[float]`, *optional*, defaults to 1.0):
-                The percentage of total steps at which the ControlNet stops applying.
-            original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
-                If `original_size` is not the same as `target_size` the image will appear to be down- or upsampled.
-                `original_size` defaults to `(height, width)` if not specified. Part of SDXL's micro-conditioning as
-                explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952).
-            crops_coords_top_left (`Tuple[int]`, *optional*, defaults to (0, 0)):
-                `crops_coords_top_left` can be used to generate an image that appears to be "cropped" from the position
-                `crops_coords_top_left` downwards. Favorable, well-centered images are usually achieved by setting
-                `crops_coords_top_left` to (0, 0). Part of SDXL's micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952).
-            target_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
-                For most cases, `target_size` should be set to the desired height and width of the generated image. If
-                not specified it will default to `(height, width)`. Part of SDXL's micro-conditioning as explained in
-                section 2.2 of [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952).
-            negative_original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
-                To negatively condition the generation process based on a specific image resolution. Part of SDXL's
-                micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). For more
-                information, refer to this issue thread: https://github.com/huggingface/diffusers/issues/4208.
-            negative_crops_coords_top_left (`Tuple[int]`, *optional*, defaults to (0, 0)):
-                To negatively condition the generation process based on a specific crop coordinates. Part of SDXL's
-                micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). For more
-                information, refer to this issue thread: https://github.com/huggingface/diffusers/issues/4208.
-            negative_target_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
-                To negatively condition the generation process based on a target image resolution. It should be as same
-                as the `target_size` for most cases. Part of SDXL's micro-conditioning as explained in section 2.2 of
-                [https://huggingface.co/papers/2307.01952](https://huggingface.co/papers/2307.01952). For more
-                information, refer to this issue thread: https://github.com/huggingface/diffusers/issues/4208.
-            clip_skip (`int`, *optional*):
-                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
-                the output of the pre-final layer will be used for computing the prompt embeddings.
-            callback_on_step_end (`Callable`, *optional*):
-                A function that calls at the end of each denoising steps during the inference. The function is called
-                with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
-                callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
-                `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`List`, *optional*):
-                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
-                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
-                `._callback_tensor_inputs` attribute of your pipeine class.
+            # Input validation
+            if prompt is None and prompt_embeds is None:
+                raise ValueError("Either `prompt` or `prompt_embeds` must be provided")
+            if image is None:
+                raise ValueError("Image input cannot be None")
 
-        Examples:
+            # Process controlnet
+            if isinstance(self.controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
+                controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(self.controlnet.nets)
 
-        Returns:
-            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
-                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
-                otherwise a `tuple` is returned containing the output images.
-        """
-        lpw = LongPromptWeight()
+            # Set up cross attention kwargs
+            cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
 
-        callback = kwargs.pop("callback", None)
-        callback_steps = kwargs.pop("callback_steps", None)
+            # Process the inputs
+            device = self._execution_device
+            do_classifier_free_guidance = guidance_scale > 1.0
 
-        if callback is not None:
-            deprecate(
-                "callback",
-                "1.0.0",
-                "Passing `callback` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
-            )
-        if callback_steps is not None:
-            deprecate(
-                "callback_steps",
-                "1.0.0",
-                "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
-            )
-
-        controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
-
-        # align format for control guidance
-        if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
-            control_guidance_start = len(control_guidance_end) * [control_guidance_start]
-        elif not isinstance(control_guidance_end, list) and isinstance(control_guidance_start, list):
-            control_guidance_end = len(control_guidance_start) * [control_guidance_end]
-        elif not isinstance(control_guidance_start, list) and not isinstance(control_guidance_end, list):
-            mult = len(controlnet.nets) if isinstance(controlnet, MultiControlNetModel) else 1
-            control_guidance_start, control_guidance_end = (
-                mult * [control_guidance_start],
-                mult * [control_guidance_end],
-            )
-
-        # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
-            prompt,
-            prompt_2,
-            image,
-            callback_steps,
-            negative_prompt,
-            negative_prompt_2,
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-            controlnet_conditioning_scale,
-            control_guidance_start,
-            control_guidance_end,
-            callback_on_step_end_tensor_inputs,
-        )
-
-        self._guidance_scale = guidance_scale
-        self._clip_skip = clip_skip
-        self._cross_attention_kwargs = cross_attention_kwargs
-
-        # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
-        device = self._execution_device
-
-        if isinstance(controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
-            controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet.nets)
-
-        global_pool_conditions = (
-            controlnet.config.global_pool_conditions
-            if isinstance(controlnet, ControlNetModel)
-            else controlnet.nets[0].config.global_pool_conditions
-        )
-        guess_mode = guess_mode or global_pool_conditions
-
-        # 3.1 Encode input prompt
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-        ) = lpw.get_weighted_text_embeddings_sdxl(
-            pipe=self, 
-            prompt=prompt, 
-            neg_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-        )
-        
-        # 3.2 Encode image prompt
-        prompt_image_emb = self._encode_prompt_image_emb(image_embeds, 
-                                                         device,
-                                                         self.unet.dtype,
-                                                         self.do_classifier_free_guidance)
-        
-        # 4. Prepare image
-        if isinstance(controlnet, ControlNetModel):
-            image = self.prepare_image(
-                image=image,
-                width=width,
-                height=height,
-                batch_size=batch_size * num_images_per_prompt,
-                num_images_per_prompt=num_images_per_prompt,
+            prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.encode_prompt(
+                prompt=prompt,
+                prompt_2=prompt_2,
                 device=device,
-                dtype=controlnet.dtype,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
-                guess_mode=guess_mode,
+                num_images_per_prompt=num_images_per_prompt,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
+                negative_prompt_2=negative_prompt_2,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                lora_scale=cross_attention_kwargs.get("scale", None),
+                clip_skip=clip_skip,
             )
-            height, width = image.shape[-2:]
-        elif isinstance(controlnet, MultiControlNetModel):
-            images = []
 
-            for image_ in image:
-                image_ = self.prepare_image(
-                    image=image_,
+            # Process image input
+            if isinstance(self.controlnet, MultiControlNetModel) and isinstance(image, list):
+                images = []
+                for image_ in image:
+                    images.append(self.prepare_image(
+                        image=image_,
+                        width=width,
+                        height=height,
+                        batch_size=prompt_embeds.shape[0] * num_images_per_prompt,
+                        num_images_per_prompt=num_images_per_prompt,
+                        device=device,
+                        dtype=self.controlnet.dtype,
+                        do_classifier_free_guidance=do_classifier_free_guidance,
+                        guess_mode=guess_mode,
+                    ))
+                image = images
+            else:
+                image = self.prepare_image(
+                    image=image,
                     width=width,
                     height=height,
-                    batch_size=batch_size * num_images_per_prompt,
+                    batch_size=prompt_embeds.shape[0] * num_images_per_prompt,
                     num_images_per_prompt=num_images_per_prompt,
                     device=device,
-                    dtype=controlnet.dtype,
-                    do_classifier_free_guidance=self.do_classifier_free_guidance,
+                    dtype=self.controlnet.dtype,
+                    do_classifier_free_guidance=do_classifier_free_guidance,
                     guess_mode=guess_mode,
                 )
 
-                images.append(image_)
+            # Process control mask if provided
+            if control_mask is not None:
+                control_mask = self.prepare_control_mask(
+                    control_mask=control_mask,
+                    width=width,
+                    height=height,
+                    batch_size=prompt_embeds.shape[0] * num_images_per_prompt,
+                    num_images_per_prompt=num_images_per_prompt,
+                    device=device,
+                    dtype=self.controlnet.dtype,
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                    guess_mode=guess_mode,
+                )
 
-            image = images
-            height, width = image[0].shape[-2:]
-        else:
-            assert False
+            # Prepare timesteps
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = self.scheduler.timesteps
 
-        # 4.1 Region control
-        if control_mask is not None:
-            mask_weight_image = control_mask
-            mask_weight_image = np.array(mask_weight_image)
-            mask_weight_image_tensor = torch.from_numpy(mask_weight_image).to(device=device, dtype=prompt_embeds.dtype)
-            mask_weight_image_tensor = mask_weight_image_tensor[:, :, 0] / 255.
-            mask_weight_image_tensor = mask_weight_image_tensor[None, None]
-            h, w = mask_weight_image_tensor.shape[-2:]
-            control_mask_wight_image_list = []
-            for scale in [8, 8, 8, 16, 16, 16, 32, 32, 32]:
-                scale_mask_weight_image_tensor = F.interpolate(
-                    mask_weight_image_tensor,(h // scale, w // scale), mode='bilinear')
-                control_mask_wight_image_list.append(scale_mask_weight_image_tensor)
-            region_mask = torch.from_numpy(np.array(control_mask)[:, :, 0]).to(self.unet.device, dtype=self.unet.dtype) / 255.
-            region_control.prompt_image_conditioning = [dict(region_mask=region_mask)]
-        else:
-            control_mask_wight_image_list = None
-            region_control.prompt_image_conditioning = [dict(region_mask=None)]
-
-        # 5. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-        self._num_timesteps = len(timesteps)
-
-        # 6. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
-
-        # 6.5 Optionally get Guidance Scale Embedding
-        timestep_cond = None
-        if self.unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
-            timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
-            ).to(device=device, dtype=latents.dtype)
-
-        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
-        # 7.1 Create tensor stating which controlnets to keep
-        controlnet_keep = []
-        for i in range(len(timesteps)):
-            keeps = [
-                1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
-                for s, e in zip(control_guidance_start, control_guidance_end)
-            ]
-            controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
-
-        # 7.2 Prepare added time ids & embeddings
-        if isinstance(image, list):
-            original_size = original_size or image[0].shape[-2:]
-        else:
-            original_size = original_size or image.shape[-2:]
-        target_size = target_size or (height, width)
-
-        add_text_embeds = pooled_prompt_embeds
-        if self.text_encoder_2 is None:
-            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
-        else:
-            text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
-
-        add_time_ids = self._get_add_time_ids(
-            original_size,
-            crops_coords_top_left,
-            target_size,
-            dtype=prompt_embeds.dtype,
-            text_encoder_projection_dim=text_encoder_projection_dim,
-        )
-
-        if negative_original_size is not None and negative_target_size is not None:
-            negative_add_time_ids = self._get_add_time_ids(
-                negative_original_size,
-                negative_crops_coords_top_left,
-                negative_target_size,
+            # Prepare latents
+            num_channels_latents = self.unet.config.in_channels
+            latents = self.prepare_latents(
+                batch_size=prompt_embeds.shape[0],
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
                 dtype=prompt_embeds.dtype,
-                text_encoder_projection_dim=text_encoder_projection_dim,
+                device=device,
+                generator=generator,
+                latents=latents,
             )
-        else:
-            negative_add_time_ids = add_time_ids
 
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
-            add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+            # Prepare extra step kwargs
+            extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        prompt_embeds = prompt_embeds.to(device)
-        add_text_embeds = add_text_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
-        encoder_hidden_states = torch.cat([prompt_embeds, prompt_image_emb], dim=1)
+            # Process image embeddings
+            if image_embeds is not None:
+                image_embeds = self.prepare_image_embeds(image_embeds, device, do_classifier_free_guidance)
 
-        # 8. Denoising loop
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        is_unet_compiled = is_compiled_module(self.unet)
-        is_controlnet_compiled = is_compiled_module(self.controlnet)
-        is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
-                
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                # Relevant thread:
-                # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
-                if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
-                    torch._inductor.cudagraph_mark_step_begin()
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            # Denoising loop
+            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for i, t in enumerate(timesteps):
+                    # Expand latents for classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
-                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                    # Scale latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # controlnet(s) inference
-                if guess_mode and self.do_classifier_free_guidance:
-                    # Infer ControlNet only for the conditional batch.
-                    control_model_input = latents
-                    control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-                    controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
-                    controlnet_added_cond_kwargs = {
-                        "text_embeds": add_text_embeds.chunk(2)[1],
-                        "time_ids": add_time_ids.chunk(2)[1],
-                    }
-                else:
+                    # ControlNet(s) inference
                     control_model_input = latent_model_input
                     controlnet_prompt_embeds = prompt_embeds
-                    controlnet_added_cond_kwargs = added_cond_kwargs
-                
-                if isinstance(controlnet_keep[i], list):
-                    cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
-                else:
-                    controlnet_cond_scale = controlnet_conditioning_scale
-                    if isinstance(controlnet_cond_scale, list):
-                        controlnet_cond_scale = controlnet_cond_scale[0]
-                    cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                    
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=image,
+                        conditioning_scale=controlnet_conditioning_scale,
+                        guess_mode=guess_mode,
+                        return_dict=False,
+                    )
 
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    control_model_input,
-                    t,
-                    encoder_hidden_states=prompt_image_emb,
-                    controlnet_cond=image,
-                    conditioning_scale=cond_scale,
-                    guess_mode=guess_mode,
-                    added_cond_kwargs=controlnet_added_cond_kwargs,
-                    return_dict=False,
-                )
+                    # Predict noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                        return_dict=False,
+                    )[0]
 
-                # controlnet mask
-                if control_mask_wight_image_list is not None:
-                    down_block_res_samples = [
-                        down_block_res_sample * mask_weight
-                        for down_block_res_sample, mask_weight in zip(down_block_res_samples, control_mask_wight_image_list)
-                    ]
-                    mid_block_res_sample *= control_mask_wight_image_list[-1]
+                    # Perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                if guess_mode and self.do_classifier_free_guidance:
-                    # Infered ControlNet only for the conditional batch.
-                    # To apply the output of ControlNet to both the unconditional and conditional batches,
-                    # add 0 to the unconditional batch to keep it unchanged.
-                    down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
-                    mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+                    # Compute previous noisy sample
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=encoder_hidden_states,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
+                    # Update progress
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback_on_step_end is not None:
+                            callback_kwargs = {}
+                            for k in callback_on_step_end_tensor_inputs:
+                                callback_kwargs[k] = locals()[k]
+                            callback_on_step_end(i, t, callback_kwargs)
 
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        step_idx = i // getattr(self.scheduler, "order", 1)
-                        callback(step_idx, t, latents)
-        
-        if not output_type == "latent":
-            # make sure the VAE is in float32 mode, as it overflows in float16
-            needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
-            if needs_upcasting:
-                self.upcast_vae()
-                latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
-            
+            # Post-processing
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
 
-            # cast back to fp16 if needed
-            if needs_upcasting:
-                self.vae.to(dtype=torch.float16)            
-        else:
-            image = latents
+            # Memory cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        if not output_type == "latent":
-            # apply watermark if available
-            if self.watermark is not None:
-                image = self.watermark.apply_watermark(image)
+            if not output_type == "latent":
+                image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=[True] * image.shape[0])
 
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            # Offload all models
+            self.maybe_free_model_hooks()
 
-        # Offload all models
-        self.maybe_free_model_hooks()
+            if not return_dict:
+                return (image, has_nsfw_concept)
 
-        if not return_dict:
-            return (image,)
+            return StableDiffusionXLPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
 
-        return StableDiffusionXLPipelineOutput(images=image)
+        except Exception as e:
+            logger.error(f"Error during pipeline execution: {str(e)}")
+            raise RuntimeError(f"Pipeline execution failed: {str(e)}")
+
+    def prepare_image_embeds(self, image_embeds, device, do_classifier_free_guidance):
+        """Prepare image embeddings with validation."""
+        try:
+            if not isinstance(image_embeds, torch.Tensor):
+                raise ValueError("Image embeddings must be a torch.Tensor")
+            
+            image_embeds = image_embeds.to(device=device, dtype=self.text_encoder.dtype)
+            if do_classifier_free_guidance:
+                image_embeds = torch.cat([image_embeds] * 2)
+            
+            return image_embeds
+        except Exception as e:
+            logger.error(f"Error preparing image embeddings: {str(e)}")
+            raise
+
+    def prepare_control_mask(self, control_mask, width, height, batch_size, num_images_per_prompt, device, dtype, do_classifier_free_guidance, guess_mode):
+        """Prepare control mask with validation and error handling."""
+        try:
+            if not isinstance(control_mask, (PIL.Image.Image, np.ndarray, torch.Tensor)):
+                raise ValueError("Control mask must be a PIL Image, numpy array, or torch.Tensor")
+            
+            if isinstance(control_mask, PIL.Image.Image):
+                control_mask = np.array(control_mask)
+            
+            if isinstance(control_mask, np.ndarray):
+                control_mask = torch.from_numpy(control_mask)
+            
+            control_mask = control_mask.to(device=device, dtype=dtype)
+            control_mask = control_mask.repeat(batch_size * num_images_per_prompt, 1, 1, 1)
+            
+            if do_classifier_free_guidance and not guess_mode:
+                control_mask = torch.cat([control_mask] * 2)
+            
+            return control_mask
+        except Exception as e:
+            logger.error(f"Error preparing control mask: {str(e)}")
+            raise
