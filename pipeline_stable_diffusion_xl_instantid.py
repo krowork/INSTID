@@ -40,6 +40,9 @@ from ip_adapter.resampler import Resampler
 from ip_adapter.attention_processor import AttnProcessor, IPAttnProcessor
 from ip_adapter.attention_processor import region_control
 
+import os
+from PIL import Image, ImageDraw
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -613,7 +616,10 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         control_mask = None,
         **kwargs,
     ):
-        """Enhanced pipeline call with better error handling and memory management."""
+        """Enhanced pipeline call with better error handling and memory management.
+
+        Examples:
+        """
         try:
             # Memory optimization before generation
             if torch.cuda.is_available():
@@ -831,3 +837,27 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
         except Exception as e:
             logger.error(f"Error preparing control mask: {str(e)}")
             raise
+
+def draw_kps(image: Image.Image, kps: np.ndarray, color: tuple = (255, 0, 0), size: int = 4) -> Image.Image:
+    """Dibuja puntos clave (keypoints) en una imagen.
+    
+    Args:
+        image: Imagen PIL sobre la que dibujar
+        kps: Array numpy con los keypoints en formato [[x1,y1], [x2,y2], ...]
+        color: Color de los puntos (R,G,B)
+        size: Tamaño de los puntos
+        
+    Returns:
+        Imagen PIL con los keypoints dibujados
+    """
+    # Crear una copia de la imagen para no modificar la original
+    result = image.copy()
+    draw = ImageDraw.Draw(result)
+    
+    # Dibujar cada keypoint
+    for x, y in kps:
+        x1, y1 = int(x - size), int(y - size)
+        x2, y2 = int(x + size), int(y + size)
+        draw.ellipse([x1, y1, x2, y2], fill=color)
+        
+    return result
