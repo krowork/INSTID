@@ -25,3 +25,55 @@ license: apache-2.0
 ---
 
 Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+
+# InstantID Web Interface
+
+Una interfaz web para [InstantID](https://github.com/InstantX/InstantID), un método para generar imágenes que preservan la identidad de una persona en segundos.
+
+## Requisitos
+
+- Python 3.8+
+- CUDA compatible GPU (recomendado)
+
+## Instalación
+
+1. Clonar el repositorio:
+```bash
+git clone https://github.com/krowork/INSTID.git
+cd INSTID
+```
+
+2. Instalar dependencias:
+```bash
+pip install -r requirements.txt
+```
+
+## Uso
+
+1. Ejecutar la interfaz web:
+```bash
+python gradio_interface.py
+```
+
+2. Abrir el navegador en la URL mostrada (generalmente `http://localhost:7860`)
+
+3. En la interfaz web:
+   - Subir una imagen con un rostro claro y visible
+   - Ajustar el prompt de texto para describir la imagen deseada
+   - Ajustar los parámetros según sea necesario:
+     - Número de pasos (20-100)
+     - Fuerza de IdentityNet (0.0-1.5)
+     - Fuerza del Adapter (0.0-1.5)
+   - Hacer clic en "Submit" para generar la imagen
+
+## Parámetros
+
+- **Número de pasos**: Controla la cantidad de pasos de inferencia. Más pasos = mejor calidad pero más tiempo.
+- **Fuerza IdentityNet**: Controla cuánto se preservan los rasgos faciales. Mayor valor = más similitud facial.
+- **Fuerza Adapter**: Controla la influencia del adaptador de identidad. Mayor valor = más influencia de la imagen original.
+
+## Notas
+
+- La primera ejecución descargará automáticamente los modelos necesarios (~5GB)
+- Se recomienda usar una GPU para mejor rendimiento
+- Las imágenes generadas se mostrarán en la interfaz web

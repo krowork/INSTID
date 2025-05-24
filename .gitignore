@@ -1,2 +1,9 @@
 .venv/
 models/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
