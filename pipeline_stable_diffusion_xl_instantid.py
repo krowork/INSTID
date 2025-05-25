@@ -578,9 +578,6 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                     num_attention_heads=8,
                     attention_head_dim=64,
                     cross_attention_dim=self.unet.config.cross_attention_dim,
-                    ff_inner_dim=None,
-                    ff_bias=True,
-                    post_attention_norm=True,
                 )
                 ip_layers.append(layer)
             
