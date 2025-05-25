@@ -574,7 +574,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             
             for i in range(len(self.unet.up_blocks)):
                 layer = BasicTransformerBlock(
-                    dim=self.up_blocks[i].resnets[1].out_channels,
+                    dim=self.unet.up_blocks[i].resnets[1].out_channels,
                     num_attention_heads=8,
                     attention_head_dim=64,
                     cross_attention_dim=self.unet.config.cross_attention_dim,
