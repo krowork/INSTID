@@ -513,7 +513,7 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
                 dim=self.unet.config.cross_attention_dim,
                 depth=4,
                 dim_head=64,
-                heads=12,
+                heads=16,
                 num_queries=num_tokens,
                 embedding_dim=image_emb_dim,
                 output_dim=self.unet.config.cross_attention_dim,
