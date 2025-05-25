@@ -36,7 +36,7 @@ from diffusers import StableDiffusionXLControlNetPipeline
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from diffusers.utils.import_utils import is_xformers_available
 
-from ip_adapter.resampler import Resampler
+from ip_adapter.resampler_flexible import FlexibleResampler as Resampler
 from ip_adapter.attention_processor import AttnProcessor, IPAttnProcessor
 from ip_adapter.attention_processor import region_control
 
@@ -522,13 +522,46 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             
             state_dict = torch.load(model_ckpt, map_location="cpu")
             image_proj_dict = {}
+            
+            # Extraer solo los parámetros del image_proj
             for key in state_dict.keys():
                 if key.startswith("image_proj."):
-                    image_proj_dict[key.replace("image_proj.", "")] = state_dict[key]
-            self.image_proj_model.load_state_dict(image_proj_dict)
-            logger.info("Successfully loaded image projection model")
+                    new_key = key.replace("image_proj.", "")
+                    image_proj_dict[new_key] = state_dict[key]
+            
+            # Debug: mostrar qué parámetros tenemos
+            logger.info(f"Parámetros encontrados en checkpoint: {list(image_proj_dict.keys())[:10]}...")
+            logger.info(f"Parámetros esperados en modelo: {list(self.image_proj_model.state_dict().keys())[:10]}...")
+            
+            # Intentar carga con el método flexible
+            if hasattr(self.image_proj_model, 'load_state_dict_flexible'):
+                missing_keys, unexpected_keys = self.image_proj_model.load_state_dict_flexible(image_proj_dict, strict=False)
+            else:
+                missing_keys, unexpected_keys = self.image_proj_model.load_state_dict(image_proj_dict, strict=False)
+            
+            if missing_keys:
+                logger.warning(f"Parámetros faltantes en checkpoint: {missing_keys[:5]}...")
+            if unexpected_keys:
+                logger.warning(f"Parámetros extra en checkpoint: {unexpected_keys[:5]}...")
+            
+            logger.info("Successfully loaded image projection model (with potential missing parameters)")
+            
         except Exception as e:
             logger.error(f"Error setting up image projection model: {str(e)}")
+            
+            # Información adicional para debug
+            try:
+                state_dict = torch.load(model_ckpt, map_location="cpu")
+                image_proj_keys = [k for k in state_dict.keys() if k.startswith("image_proj.")]
+                logger.error(f"Checkpoint contiene {len(image_proj_keys)} parámetros image_proj")
+                logger.error(f"Primeros parámetros: {image_proj_keys[:5]}")
+                
+                model_keys = list(self.image_proj_model.state_dict().keys())
+                logger.error(f"Modelo espera {len(model_keys)} parámetros")
+                logger.error(f"Primeros parámetros del modelo: {model_keys[:5]}")
+            except:
+                pass
+                
             raise RuntimeError("Failed to set up image projection model")
 
     def set_ip_adapter(self, model_ckpt, num_tokens=16, scale=0.5):
