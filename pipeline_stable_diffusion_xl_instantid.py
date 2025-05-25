@@ -43,6 +43,8 @@ from ip_adapter.attention_processor import region_control
 import os
 from PIL import Image, ImageDraw
 
+from diffusers.models.attention import BasicTransformerBlock
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
