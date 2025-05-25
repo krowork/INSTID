@@ -664,6 +664,38 @@ class StableDiffusionXLInstantIDPipeline(StableDiffusionXLControlNetPipeline):
             if image is None:
                 raise ValueError("Image input cannot be None")
 
+            # Validate and set default dimensions
+            if height is None or width is None:
+                # Try to get dimensions from the input image
+                if hasattr(image, 'size'):
+                    # PIL Image
+                    default_width, default_height = image.size
+                elif hasattr(image, 'shape'):
+                    # Tensor or numpy array
+                    if len(image.shape) >= 2:
+                        default_height, default_width = image.shape[-2:]
+                    else:
+                        default_height, default_width = 1024, 1024
+                else:
+                    # Default SDXL dimensions
+                    default_height, default_width = 1024, 1024
+                
+                # Ensure dimensions are multiples of 8 (required by VAE)
+                default_height = (default_height // 8) * 8
+                default_width = (default_width // 8) * 8
+                
+                # Set defaults if not provided
+                if height is None:
+                    height = default_height
+                if width is None:
+                    width = default_width
+                    
+                logger.info(f"Using dimensions: {width}x{height}")
+
+            # Ensure height and width are integers
+            height = int(height)
+            width = int(width)
+
             # Process controlnet
             if isinstance(self.controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
                 controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(self.controlnet.nets)
